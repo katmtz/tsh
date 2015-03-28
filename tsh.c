@@ -110,6 +110,9 @@ void block_sigall();
 void unblock_sigall();
 void handle_child(struct cmdline_tokens *tok, int bg, pid_t pid, sigset_t *sigs, char *cmdline);
 void handle_parent(struct cmdline_tokens *tok, int bg, pid_t pid, sigset_t *sigs, char *cmdline);
+void do_bg(struct cmdline_tokens *tok);
+void do_fg(struct cmdline_tokens *tok);
+void resume_job(struct job_t *job, int bg);
 
 /*
  * main - The shell's main routine
@@ -414,12 +417,10 @@ sigchld_handler(int sig)
             //    pid2jid(pid), pid);
             deletejob(job_list, pid);
         } else if (WIFSIGNALED(status)) {
-            if (WTERMSIG(status) == SIGINT) {
+            if (WTERMSIG(status) == SIGINT)
                 sigint_handler(SIGINT);
-            }
-            else {
-                unix_error("sigchld_handler: uncaught signal.\n");
-            }
+            else
+                unix_error("uncaught signal.");
         } else if (WIFSTOPPED(status)) {
             sigtstp_handler(WSTOPSIG(status));
         } else {
@@ -438,12 +439,11 @@ sigchld_handler(int sig)
 void sigint_handler(int sig)
 {
     pid_t pid = fgpid(job_list);
-    if (pid != 0) {
+    if (pid) {
         printf("Job [%d] (%d) terminated by signal %d\n", pid2jid(pid), pid, sig);
         deletejob(job_list, pid);
         if (kill(-pid, sig) < 0) {
-            if(errno != ESRCH)
-                unix_error("sigint_handler: kill failed");
+            unix_error("sigint_handler: kill failed");
         }
     }
     return;
@@ -457,14 +457,10 @@ void sigint_handler(int sig)
 void sigtstp_handler(int sig)
 {
     pid_t pid = fgpid(job_list);
-    if (pid != 0) {
+    if (pid) {
         printf("Job [%d] (%d)stopped by signal %d\n", pid2jid(pid), pid, sig);
         struct job_t *job = getjobpid(job_list, pid);
         job->state = ST;
-        if (kill(-pid, sig) < 0) {
-            if(errno != ESRCH)
-                unix_error("sigint_handler: kill failed");
-        }
     }
     return;
 }
@@ -743,14 +739,26 @@ int check_builtins(struct cmdline_tokens* tok) {
             return 1;
         case BUILTIN_JOBS:
             if (tok->outfile != NULL) {
-                printf("TODO: write output to file.\n");
+                int fd_out;
+                int saved_out = dup(STDOUT_FILENO);
+                if ((fd_out = open(tok->outfile, O_WRONLY)) < 0)
+                    unix_error("Could not open output file.\n");
+                if (dup2(fd_out, STDOUT_FILENO) < 0)
+                    unix_error("Error with dup2.\n");
+                close(fd_out);
+                listjobs(job_list, STDOUT_FILENO);
+                if (dup2(saved_out, STDOUT_FILENO) < 0)
+                    unix_error("Error with dup2.\n");
+                close(saved_out);
             } else {
                 listjobs(job_list, STDOUT_FILENO);
             }
             return 1;
         case BUILTIN_FG:
+            do_fg(tok);
             return 1;
         case BUILTIN_BG:
+            do_bg(tok);
             return 1;
         default:
             return 0;
@@ -810,10 +818,22 @@ void handle_child(struct cmdline_tokens *tok, int bg, pid_t pid, sigset_t *sigs,
         else
             unix_error("Error: Unknown issue setting pgid.\n");
     }
-    if (tok->infile != NULL)
-        printf("TODO: read from input file.\n");
-    if (tok->outfile != NULL)
-        printf("TODO: write to output file");
+    if (tok->infile != NULL) {
+        int fd_in;
+        if ((fd_in = open(tok->infile, O_RDONLY)) < 0)
+            unix_error("Error opening input file.\n");
+        if (dup2(fd_in, STDIN_FILENO) < 0)
+            unix_error("Error with dup2.\n");
+        close(fd_in);
+    }
+    if (tok->outfile != NULL) {
+        int fd_out;
+        if ((fd_out = open(tok->outfile, O_WRONLY)) < 0)
+            unix_error("Error opening output file.\n");
+        if (dup2(fd_out, STDOUT_FILENO) < 0)
+            unix_error("Error with dup2.\n");
+        close(fd_out);
+    }
     if(execvp(tok->argv[0], tok->argv) < 0){
         printf("%s: Command not found.\n", tok->argv[0]);
         exit(0);
@@ -832,9 +852,81 @@ void handle_parent(struct cmdline_tokens *tok, int bg, pid_t pid, sigset_t *sigs
         }
     } else {
         addjob(job_list, pid, BG, cmdline);
-        printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
+        printf("[%d] (%d) %s\n", pid2jid(pid), pid, cmdline);
     }
     unblock_sigchld(sigs);
     /* handles sigchld then returns. */
     return;
 }
+
+void do_bg(struct cmdline_tokens *tok) {
+    if (tok->argv[1]) {
+        if (tok->argv[1][0] == '%') {
+            // searching by job id
+            int jid = atoi((char*) &(tok->argv[1][1]));
+            struct job_t *job = getjobjid(job_list, jid);
+            if (job)
+                resume_job(job, 1); // boolean 1: is background.
+            else
+                printf("%%%d: No such job./n", jid);
+        } else if (isdigit(tok->argv[1][0])) {
+            // searching by pid
+            int pid = atoi(tok->argv[1]);
+            struct job_t *job = getjobpid(job_list, pid);
+            if (job)
+                resume_job(job, 1);
+            else
+                printf("%%%d: No such process.\n", pid);
+        } else {
+            printf("bg requires either a JID or PID.\n");
+        }
+    } else {
+        printf("bg requires an argument.\n");
+    }
+    return;
+}
+
+void do_fg(struct cmdline_tokens *tok) {
+    if (tok->argv[1]) {
+        if (tok->argv[1][0] == '%') {
+            // searching by job id
+            int jid = atoi((char*) &(tok->argv[1][1]));
+            struct job_t *job = getjobjid(job_list, jid);
+            if (job)
+                resume_job(job, 0); // boolean 1: is background.
+            else
+                printf("%%%d: No such job./n", jid);
+        } else if (isdigit(tok->argv[1][0])) {
+            // searching by pid
+            int pid = atoi(tok->argv[1]);
+            struct job_t *job = getjobpid(job_list, pid);
+            if (job)
+                resume_job(job, 0);
+            else
+                printf("%%%d: No such process.\n", pid);
+        } else {
+            printf("fg requires either a JID or PID.\n");
+        }
+    } else {
+        printf("fg requires an argument.\n");
+    }
+    return;
+}
+
+void resume_job(struct job_t *job, int bg) {
+    if (job->state == ST) {
+        int newst = (bg) ? BG : FG;
+        job->state = newst;
+        kill(-job->pid, SIGCONT);
+        if (!bg) {
+            while (job->pid == fgpid(job_list)) {
+                sigset_t s;
+                sigsuspend(&s);
+            }
+        } else {
+            printf("[%d] (%d) %s", job->jid, job->pid, job->cmdline);
+        }
+    }
+    return;
+}
+
