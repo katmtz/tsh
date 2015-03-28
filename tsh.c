@@ -402,31 +402,30 @@ sigchld_handler(int sig)
     pid_t pid;
     int status;
 
-    printf("sigchld_handler: entering...\n");
+    // printf("sigchld_handler: entering...\n");
 
     // while there are children that haven't terminated,
     // continue checking for children
     while((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
         // if terminated child is in foreground
-        if (pid == fgpid(job_list)) {
-            printf("sigchld_handler: Proccess (%d) is the foreground process.\n", pid); // DEBUG
-            if (WIFEXITED(status)) {
-                printf("sigchld_handler: Job [%d] (%d) has exited.\n",
-                        pid2jid(pid), pid);
-                deletejob(job_list, pid);
-            }
-            else if (WIFSIGNALED(status)) {
-                printf("sigchld_handler: Job [%d] (%d) terminated.\n",
-                        pid2jid(pid), pid);
-                deletejob(job_list, pid);
-            } else if (WIFSTOPPED(status)) {
-                printf("sigchld_handler: Job [%d] (%d) stopped.\n",
-                        pid2jid(pid), pid);
-                getjobpid(job_list, pid)->state = ST;
-            }
+        if (WIFEXITED(status)) {
+            //printf("sigchld_handler: Job [%d] (%d) has exited.\n",
+            //    pid2jid(pid), pid);
+            deletejob(job_list, pid);
+        }
+        else if (WIFSIGNALED(status)) {
+            //printf("sigchld_handler: Job [%d] (%d) terminated.\n",
+            //        pid2jid(pid), pid);
+            deletejob(job_list, pid);
+        } else if (WIFSTOPPED(status)) {
+            //printf("sigchld_handler: Job [%d] (%d) stopped.\n",
+            //        pid2jid(pid), pid);
+            getjobpid(job_list, pid)->state = ST;
+        } else {
+            deletejob(job_list, pid);
         }
     }
-    printf("sigchld_handler: exiting.\n");
+    //printf("sigchld_handler: exiting.\n");
     return;
 }
 
@@ -438,6 +437,14 @@ sigchld_handler(int sig)
 void
 sigint_handler(int sig)
 {
+    pid_t pid = fgpid(job_list);
+    if (pid != 0) {
+        deletejob(job_list, pid);
+        if (kill(pid, sig) < 0) {
+            if(errno != ESRCH)
+                unix_error("sigint_handler: kill failed");
+        }
+    }
     return;
 }
 
@@ -449,6 +456,7 @@ sigint_handler(int sig)
 void
 sigtstp_handler(int sig)
 {
+
     return;
 }
 
@@ -721,15 +729,15 @@ int check_builtins(struct cmdline_tokens* tok) {
         case BUILTIN_NONE:
             return 0;
         case BUILTIN_QUIT:
-            printf("Bye!\n");
+            //printf("Bye!\n");
             exit(0);
             return 1;
         case BUILTIN_JOBS:
             if (tok->outfile != NULL) {
                 printf("TODO: write output to file.\n");
+            } else {
+                listjobs(job_list, STDOUT_FILENO);
             }
-            printf("You called the built-in function jobs!\n"); //DEBUG
-            listjobs(job_list, STDOUT_FILENO);
             return 1;
         case BUILTIN_FG:
             return 1;
@@ -741,7 +749,7 @@ int check_builtins(struct cmdline_tokens* tok) {
 }
 
 void block_sigchld(sigset_t *old) {
-    printf("blocking sigchld\n"); // DEBUG
+    //printf("blocking sigchld\n"); // DEBUG
     sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGCHLD);
@@ -750,7 +758,7 @@ void block_sigchld(sigset_t *old) {
 }
 
 void unblock_sigchld(sigset_t *old) {
-    printf("unblocking sigchld\n"); // DEBUG
+    //printf("unblocking sigchld\n"); // DEBUG
     sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGCHLD);
@@ -759,8 +767,9 @@ void unblock_sigchld(sigset_t *old) {
 }
 
 void handle_child(struct cmdline_tokens *tok, int bg, pid_t pid, sigset_t *sigs, char *cmdline) {
-    printf("handle child called\n"); // DEBUG
-    if (setpgid(pid, 0)) {
+    //printf("handle child called\n"); // DEBUG
+    unblock_sigchld(sigs);
+    if (setpgid(0, 0)) {
         if (errno == EACCES)
             unix_error("Error: One or more children have already performed an execve.\n");
         else if (errno == EINVAL)
@@ -774,8 +783,7 @@ void handle_child(struct cmdline_tokens *tok, int bg, pid_t pid, sigset_t *sigs,
         printf("TODO: read from input file.\n");
     if (tok->outfile != NULL)
         printf("TODO: write to output file");
-    // unblock_sigchld(sigs); // not sure if necessary???
-    if(execve(tok->argv[0], tok->argv, environ) < 0){
+    if(execvp(tok->argv[0], tok->argv) < 0){
         printf("%s: Command not found.\n", tok->argv[0]);
         exit(0);
     }
@@ -783,11 +791,17 @@ void handle_child(struct cmdline_tokens *tok, int bg, pid_t pid, sigset_t *sigs,
 }
 
 void handle_parent(struct cmdline_tokens *tok, int bg, pid_t pid, sigset_t *sigs, char *cmdline) {
-    printf("handle parent called.\n"); // DEBUG
+    //printf("handle parent called.\n"); // DEBUG
     if (!bg) {
         /* add child job to the foreground */
-        printf("adding process (%d) to FG.\n", pid); // DEBUG
+        //printf("adding process (%d) to FG.\n", pid); // DEBUG
         addjob(job_list, pid, FG, cmdline);
+        while (pid == fgpid(job_list)) {
+            sigsuspend(sigs);
+        }
+    } else {
+        addjob(job_list, pid, BG, cmdline);
+        printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
     }
     unblock_sigchld(sigs);
     /* handles sigchld then returns. */
