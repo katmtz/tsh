@@ -106,9 +106,10 @@ handler_t *Signal(int signum, handler_t *handler);
 int check_builtins(struct cmdline_tokens *tok);
 void block_sigchld(sigset_t *old);
 void unblock_sigchld(sigset_t *old);
+void block_sigall();
+void unblock_sigall();
 void handle_child(struct cmdline_tokens *tok, int bg, pid_t pid, sigset_t *sigs, char *cmdline);
 void handle_parent(struct cmdline_tokens *tok, int bg, pid_t pid, sigset_t *sigs, char *cmdline);
-void waitfg(pid_t pid, int *status);
 
 /*
  * main - The shell's main routine
@@ -412,15 +413,15 @@ sigchld_handler(int sig)
             //printf("sigchld_handler: Job [%d] (%d) has exited.\n",
             //    pid2jid(pid), pid);
             deletejob(job_list, pid);
-        }
-        else if (WIFSIGNALED(status)) {
-            //printf("sigchld_handler: Job [%d] (%d) terminated.\n",
-            //        pid2jid(pid), pid);
-            deletejob(job_list, pid);
+        } else if (WIFSIGNALED(status)) {
+            if (WTERMSIG(status) == SIGINT) {
+                sigint_handler(SIGINT);
+            }
+            else {
+                unix_error("sigchld_handler: uncaught signal.\n");
+            }
         } else if (WIFSTOPPED(status)) {
-            //printf("sigchld_handler: Job [%d] (%d) stopped.\n",
-            //        pid2jid(pid), pid);
-            getjobpid(job_list, pid)->state = ST;
+            sigtstp_handler(WSTOPSIG(status));
         } else {
             deletejob(job_list, pid);
         }
@@ -434,13 +435,13 @@ sigchld_handler(int sig)
  *    user types ctrl-c at the keyboard.  Catch it and send it along
  *    to the foreground job.
  */
-void
-sigint_handler(int sig)
+void sigint_handler(int sig)
 {
     pid_t pid = fgpid(job_list);
     if (pid != 0) {
+        printf("Job [%d] (%d) terminated by signal %d\n", pid2jid(pid), pid, sig);
         deletejob(job_list, pid);
-        if (kill(pid, sig) < 0) {
+        if (kill(-pid, sig) < 0) {
             if(errno != ESRCH)
                 unix_error("sigint_handler: kill failed");
         }
@@ -453,10 +454,18 @@ sigint_handler(int sig)
  *     the user types ctrl-z at the keyboard. Catch it and suspend the
  *     foreground job by sending it a SIGTSTP.
  */
-void
-sigtstp_handler(int sig)
+void sigtstp_handler(int sig)
 {
-
+    pid_t pid = fgpid(job_list);
+    if (pid != 0) {
+        printf("Job [%d] (%d)stopped by signal %d\n", pid2jid(pid), pid, sig);
+        struct job_t *job = getjobpid(job_list, pid);
+        job->state = ST;
+        if (kill(-pid, sig) < 0) {
+            if(errno != ESRCH)
+                unix_error("sigint_handler: kill failed");
+        }
+    }
     return;
 }
 
@@ -764,6 +773,28 @@ void unblock_sigchld(sigset_t *old) {
     sigaddset(&mask, SIGCHLD);
     if (sigprocmask(SIG_UNBLOCK, &mask, old) < 0)
         unix_error("Error: Could not unblock SIGCHLD.\n");
+}
+
+void block_sigall() {
+    sigset_t s;
+
+    sigemptyset(&s);
+    sigaddset(&s, SIGCHLD);
+    sigaddset(&s, SIGINT);
+    sigaddset(&s, SIGTSTP);
+
+    sigprocmask(SIG_BLOCK, &s, NULL);
+}
+
+void unblock_sigall() {
+    sigset_t s;
+
+    sigemptyset(&s);
+    sigaddset(&s, SIGCHLD);
+    sigaddset(&s, SIGINT);
+    sigaddset(&s, SIGTSTP);
+
+    sigprocmask(SIG_UNBLOCK, &s, NULL);
 }
 
 void handle_child(struct cmdline_tokens *tok, int bg, pid_t pid, sigset_t *sigs, char *cmdline) {
