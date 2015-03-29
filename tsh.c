@@ -1,7 +1,8 @@
 /*
  * tsh - A tiny shell program with job control
  *
- * <Put your name and login ID here>
+ * Katherine Martinez
+ * andrew ID: kmartine
  */
 #include <assert.h>
 #include <stdio.h>
@@ -104,12 +105,12 @@ handler_t *Signal(int signum, handler_t *handler);
 
 /* Helper functions I've written */
 int check_builtins(struct cmdline_tokens *tok);
-void block_sigchld(sigset_t *old);
-void unblock_sigchld(sigset_t *old);
-void block_sigall();
-void unblock_sigall();
-void handle_child(struct cmdline_tokens *tok, int bg, pid_t pid, sigset_t *sigs, char *cmdline);
-void handle_parent(struct cmdline_tokens *tok, int bg, pid_t pid, sigset_t *sigs, char *cmdline);
+void block_sigall(sigset_t *sigs);
+void unblock_sigall(sigset_t *sigs);
+void handle_child(struct cmdline_tokens *tok, int bg, pid_t pid,
+                    sigset_t *sigs, char *cmdline);
+void handle_parent(struct cmdline_tokens *tok, int bg, pid_t pid,
+                    sigset_t *sigs, char *cmdline);
 void do_bg(struct cmdline_tokens *tok);
 void do_fg(struct cmdline_tokens *tok);
 void resume_job(struct job_t *job, int bg);
@@ -218,7 +219,7 @@ eval(char *cmdline)
         return;
     if (!check_builtins(&tok)) {
         sigset_t seto;
-        block_sigchld(&seto);
+        block_sigall(&seto);
         pid_t pid = fork();
         /* fork cases: error, new forked process,  */
         if (pid < 0) {
@@ -229,13 +230,11 @@ eval(char *cmdline)
             } else {
                 unix_error("Error: Unknown error forking process. :(\n");
             }
-        }
-        /* new child process created */
-        else if (pid == 0)
+        } else if (pid == 0) {
             handle_child(&tok, bg, pid, &seto, cmdline);
-        /* continue parent process */
-        else
+        } else {
             handle_parent(&tok, bg, pid, &seto, cmdline);
+        }
     }
     return;
 }
@@ -400,34 +399,27 @@ parseline(const char *cmdline, struct cmdline_tokens *tok)
  *     handler reaps all available zombie children, but doesn't wait
  *     for any other currently running children to terminate.
  */
-void
-sigchld_handler(int sig)
+void sigchld_handler(int sig)
 {
     pid_t pid;
     int status;
 
-    // printf("sigchld_handler: entering...\n");
-
-    // while there are children that haven't terminated,
-    // continue checking for children
+    // check all children that have terminated
     while((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
-        // if terminated child is in foreground
         if (WIFEXITED(status)) {
-            //printf("sigchld_handler: Job [%d] (%d) has exited.\n",
-            //    pid2jid(pid), pid);
             deletejob(job_list, pid);
         } else if (WIFSIGNALED(status)) {
-            if (WTERMSIG(status) == SIGINT)
-                sigint_handler(SIGINT);
-            else
-                unix_error("uncaught signal.");
+            printf("Job [%d] (%d) terminated by signal %d\n",
+                    pid2jid(pid), pid, WTERMSIG(status));
+            deletejob(job_list, pid);
         } else if (WIFSTOPPED(status)) {
-            sigtstp_handler(WSTOPSIG(status));
+            printf("Job [%d] (%d) stopped by signal %d\n",
+                    pid2jid(pid), pid, WSTOPSIG(status));
+            getjobpid(job_list, pid)->state = ST;
         } else {
             deletejob(job_list, pid);
         }
     }
-    //printf("sigchld_handler: exiting.\n");
     return;
 }
 
@@ -440,9 +432,7 @@ void sigint_handler(int sig)
 {
     pid_t pid = fgpid(job_list);
     if (pid) {
-        printf("Job [%d] (%d) terminated by signal %d\n", pid2jid(pid), pid, sig);
-        deletejob(job_list, pid);
-        if (kill(-pid, sig) < 0) {
+        if (kill(-pid, SIGINT)) {
             unix_error("sigint_handler: kill failed");
         }
     }
@@ -458,9 +448,9 @@ void sigtstp_handler(int sig)
 {
     pid_t pid = fgpid(job_list);
     if (pid) {
-        printf("Job [%d] (%d)stopped by signal %d\n", pid2jid(pid), pid, sig);
-        struct job_t *job = getjobpid(job_list, pid);
-        job->state = ST;
+        if (kill(-pid, SIGTSTP)) {
+            unix_error("sigtstp_handler: kill failed.\n");
+        }
     }
     return;
 }
@@ -734,21 +724,25 @@ int check_builtins(struct cmdline_tokens* tok) {
         case BUILTIN_NONE:
             return 0;
         case BUILTIN_QUIT:
-            //printf("Bye!\n");
             exit(0);
             return 1;
         case BUILTIN_JOBS:
+            // if there's an output file, pipe output to file, then restore
+            // STD_OUT to parent process (jobs)
             if (tok->outfile != NULL) {
                 int fd_out;
                 int saved_out = dup(STDOUT_FILENO);
-                if ((fd_out = open(tok->outfile, O_WRONLY)) < 0)
+                if ((fd_out = open(tok->outfile, O_WRONLY)) < 0) {
                     unix_error("Could not open output file.\n");
-                if (dup2(fd_out, STDOUT_FILENO) < 0)
+                }
+                if (dup2(fd_out, STDOUT_FILENO) < 0) {
                     unix_error("Error with dup2.\n");
+                }
                 close(fd_out);
                 listjobs(job_list, STDOUT_FILENO);
-                if (dup2(saved_out, STDOUT_FILENO) < 0)
+                if (dup2(saved_out, STDOUT_FILENO) < 0) {
                     unix_error("Error with dup2.\n");
+                }
                 close(saved_out);
             } else {
                 listjobs(job_list, STDOUT_FILENO);
@@ -765,25 +759,11 @@ int check_builtins(struct cmdline_tokens* tok) {
     }
 }
 
-void block_sigchld(sigset_t *old) {
-    //printf("blocking sigchld\n"); // DEBUG
-    sigset_t mask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGCHLD);
-    if (sigprocmask(SIG_BLOCK, &mask, old) < 0)
-        unix_error("Error: Could not block SIGCHLD.\n");
-}
-
-void unblock_sigchld(sigset_t *old) {
-    //printf("unblocking sigchld\n"); // DEBUG
-    sigset_t mask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGCHLD);
-    if (sigprocmask(SIG_UNBLOCK, &mask, old) < 0)
-        unix_error("Error: Could not unblock SIGCHLD.\n");
-}
-
-void block_sigall() {
+/*
+ * block_sigall - blocks all signals (SIGCHLD, SIGINT, SIGTSTP) and saves
+ * the old signal mask.
+ */
+void block_sigall(sigset_t *sigs) {
     sigset_t s;
 
     sigemptyset(&s);
@@ -791,10 +771,13 @@ void block_sigall() {
     sigaddset(&s, SIGINT);
     sigaddset(&s, SIGTSTP);
 
-    sigprocmask(SIG_BLOCK, &s, NULL);
+    sigprocmask(SIG_BLOCK, &s, sigs);
 }
 
-void unblock_sigall() {
+/*
+ * unblock_sigall - undoes block_sigall
+ */
+void unblock_sigall(sigset_t *sigs) {
     sigset_t s;
 
     sigemptyset(&s);
@@ -802,50 +785,62 @@ void unblock_sigall() {
     sigaddset(&s, SIGINT);
     sigaddset(&s, SIGTSTP);
 
-    sigprocmask(SIG_UNBLOCK, &s, NULL);
+    sigprocmask(SIG_UNBLOCK, &s, sigs);
 }
 
-void handle_child(struct cmdline_tokens *tok, int bg, pid_t pid, sigset_t *sigs, char *cmdline) {
-    //printf("handle child called\n"); // DEBUG
-    unblock_sigchld(sigs);
+/*
+ * handle_child - sets pgid to child's pid, handles any file I/O,
+ * then runs child process
+ */
+void handle_child(struct cmdline_tokens *tok, int bg, pid_t pid,
+                    sigset_t *sigs, char *cmdline) {
+    unblock_sigall(sigs);
     if (setpgid(0, 0)) {
-        if (errno == EACCES)
-            unix_error("Error: One or more children have already performed an execve.\n");
-        else if (errno == EINVAL)
-            unix_error("Error: Given pgid is less than 0.\n"); /* THIS SHOULD NEVER HAPPEN */
-        else if (errno == ESRCH)
+        if (errno == EACCES) {
+            unix_error("Error: A child has already performed an execve.\n");
+        } else if (errno == EINVAL) {
+            unix_error("Error: Given pgid is less than 0.\n");
+        } else if (errno == ESRCH) {
             unix_error("Error: Given pid doesn't match any process.\n");
-        else
+        } else {
             unix_error("Error: Unknown issue setting pgid.\n");
+        }
     }
     if (tok->infile != NULL) {
         int fd_in;
-        if ((fd_in = open(tok->infile, O_RDONLY)) < 0)
+        if ((fd_in = open(tok->infile, O_RDONLY)) < 0) {
             unix_error("Error opening input file.\n");
-        if (dup2(fd_in, STDIN_FILENO) < 0)
+        }
+        if (dup2(fd_in, STDIN_FILENO) < 0) {
             unix_error("Error with dup2.\n");
+        }
         close(fd_in);
     }
     if (tok->outfile != NULL) {
         int fd_out;
-        if ((fd_out = open(tok->outfile, O_WRONLY)) < 0)
+        if ((fd_out = open(tok->outfile, O_WRONLY)) < 0) {
             unix_error("Error opening output file.\n");
-        if (dup2(fd_out, STDOUT_FILENO) < 0)
+        }
+        if (dup2(fd_out, STDOUT_FILENO) < 0) {
             unix_error("Error with dup2.\n");
+        }
         close(fd_out);
     }
-    if(execvp(tok->argv[0], tok->argv) < 0){
+    if (execvp(tok->argv[0], tok->argv) < 0) {
         printf("%s: Command not found.\n", tok->argv[0]);
         exit(0);
     }
     return;
 }
 
-void handle_parent(struct cmdline_tokens *tok, int bg, pid_t pid, sigset_t *sigs, char *cmdline) {
-    //printf("handle parent called.\n"); // DEBUG
+/*
+ * handle_parent - add child to fore/background, wait if it's a foreground
+ * process. then unblock signals, handle them, then return.
+ */
+void handle_parent(struct cmdline_tokens *tok, int bg, pid_t pid,
+                    sigset_t *sigs, char *cmdline) {
     if (!bg) {
         /* add child job to the foreground */
-        //printf("adding process (%d) to FG.\n", pid); // DEBUG
         addjob(job_list, pid, FG, cmdline);
         while (pid == fgpid(job_list)) {
             sigsuspend(sigs);
@@ -854,29 +849,34 @@ void handle_parent(struct cmdline_tokens *tok, int bg, pid_t pid, sigset_t *sigs
         addjob(job_list, pid, BG, cmdline);
         printf("[%d] (%d) %s\n", pid2jid(pid), pid, cmdline);
     }
-    unblock_sigchld(sigs);
+    unblock_sigall(sigs);
     /* handles sigchld then returns. */
     return;
 }
 
+/*
+ * do_bg - get background job by either jid or pid, then call resume_job
+ */
 void do_bg(struct cmdline_tokens *tok) {
     if (tok->argv[1]) {
         if (tok->argv[1][0] == '%') {
             // searching by job id
             int jid = atoi((char*) &(tok->argv[1][1]));
             struct job_t *job = getjobjid(job_list, jid);
-            if (job)
+            if (job) {
                 resume_job(job, 1); // boolean 1: is background.
-            else
-                printf("%%%d: No such job./n", jid);
+            } else {
+                printf("%%%d: No such job.\n", jid);
+            }
         } else if (isdigit(tok->argv[1][0])) {
             // searching by pid
             int pid = atoi(tok->argv[1]);
             struct job_t *job = getjobpid(job_list, pid);
-            if (job)
+            if (job) {
                 resume_job(job, 1);
-            else
+            } else {
                 printf("%%%d: No such process.\n", pid);
+            }
         } else {
             printf("bg requires either a JID or PID.\n");
         }
@@ -886,24 +886,31 @@ void do_bg(struct cmdline_tokens *tok) {
     return;
 }
 
+/*
+ * do_fg - get foreground job by either jid or pid, then call resume_job
+ * note: this is functionally identical to do_bg, except that it calls
+ * resume job with bg as false.
+ */
 void do_fg(struct cmdline_tokens *tok) {
     if (tok->argv[1]) {
         if (tok->argv[1][0] == '%') {
             // searching by job id
             int jid = atoi((char*) &(tok->argv[1][1]));
             struct job_t *job = getjobjid(job_list, jid);
-            if (job)
+            if (job) {
                 resume_job(job, 0); // boolean 1: is background.
-            else
+            } else {
                 printf("%%%d: No such job./n", jid);
+            }
         } else if (isdigit(tok->argv[1][0])) {
             // searching by pid
             int pid = atoi(tok->argv[1]);
             struct job_t *job = getjobpid(job_list, pid);
-            if (job)
+            if (job) {
                 resume_job(job, 0);
-            else
+            } else {
                 printf("%%%d: No such process.\n", pid);
+            }
         } else {
             printf("fg requires either a JID or PID.\n");
         }
@@ -913,20 +920,24 @@ void do_fg(struct cmdline_tokens *tok) {
     return;
 }
 
+/*
+ * resume_job - if job is foreground, wait for it to stop. then set the
+ * new state and send the signal to all its child processes
+ */
 void resume_job(struct job_t *job, int bg) {
-    if (job->state == ST) {
-        int newst = (bg) ? BG : FG;
-        job->state = newst;
-        kill(-job->pid, SIGCONT);
-        if (!bg) {
-            while (job->pid == fgpid(job_list)) {
-                sigset_t s;
-                sigsuspend(&s);
-            }
-        } else {
-            printf("[%d] (%d) %s", job->jid, job->pid, job->cmdline);
+    int newst = (bg) ? BG : FG;
+    if (!bg) {
+        sigset_t s;
+        sigemptyset(&s);
+        while(fgpid(job_list) != 0 &&
+            job->state != ST) {
+            sigsuspend(&s);
         }
+    } else {
+        printf("[%d] (%d) %s", job->jid, job->pid, job->cmdline);
     }
+    job->state = newst;
+    kill(-(job->pid), SIGCONT);
     return;
 }
 
